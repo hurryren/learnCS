@@ -19,5 +19,11 @@ bfs_queue.o: bfs_queue.c
 bfs_queue: graph.o queue.o bfs_queue.o
 	$(CC) $(CFLAGS)  graph.o queue.o bfs_queue.o -o bfs_queue.exe
 
+dfs_recursive.o: dfs_recursive.c
+	$(CC) $(CFLAGS) -c dfs_recursive.c
+
+dfs_recursive: graph.o dfs_recursive.o
+	$(CC) $(CFLAGS)  graph.o dfs_recursive.o  -o dfs_recursive.exe
+
 clean:
 	rm *.exe *.o
