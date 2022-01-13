@@ -55,11 +55,66 @@ In the TCP headers, however, space is precious, and each byte’s index in the s
 
 
 
+## lab3
+
+
+
+TCP  is a protocol that reliably conveys a pair of flow-controlled byte streams (one in each direction) over unreliable datagrams. Two parities participate in the TCP connection, and reach party acts as both “sender”(of its own outgoing byte-stream) and “receiver” (of an incoming byte-stream) at the same time. The two parties are called the endpoints of the connection, or the peers.
+
+-   keep track of the receiver’s window(processing incoming acknos and window sizes)
+-   fill the window when possible, by reading from the ByteStream, creating new TCP segments(including SYN and FIN flags if needed), and sending them. The sender should keep sending segments until either the window is full or th bytestream is empty
+-   keep track of which segments have been sent but not yet acknowledged by the receiver--we call these outstanding segments
+-   re-send outstanding segments id enough time passes since they were sent, and they haven’t been acknowledged yes
+
+
+
+>   The basic principle is to send whatever the receiver will allow us to send (filling the window), and keep retransmitting until the receiver acknowledges each segment. This is called automatic repeat request. The sender divides the byte stream up into segments and send them, as much as the receiver’s window allows.
+
+
+
+### how does the tcpsender know if a segment was lost?
+
+Tcpsender will be sending a bunch of tcpsegments. each will contain a (possible-empty) substring from the outgoing bytestream, indexed with a sequence number to indicate its position in the stream, and marked with the SYN flag at the beginning of the stream, and FIN flag at the end.
 
 
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
 
 
 
