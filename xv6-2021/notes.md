@@ -172,6 +172,42 @@ A process can make a system call by executing the RISC-V ecall instruction. This
 
 To make xv6 more concrete, we will outline how the kernel starts and runs the first process. The subsequent chapters will describe the mechanisms that show up in this overview in more detail.
 
+When the RISC-V computer powers on, it initializers itself and runs a boot loader which is stored in read-only memory. The boot loader loads the xv6 kernel into memory. Then, in machine mode, the CPU executes xv6 starting at _entry. The RISC-V starts with paging hardware disable: virtual address map directly to physicall addresses.
+
+The loader loads the xv6 kernel into memory at physical address 0x80000000. The reason is place the kernel at 0x80000000 rather than 0x0 is because the address range 0x0:0x80000000 contains IO device.
+
+The instruction at _entry set up a stack so that xv6 can run C code. Xv6 declares space for an initial stack, stack0, in the file start.c. The code at _entry loads the stack pointer register sp with the address stack0+4096, the top of the stack, becase the stack on  RISC-V grown down. Now the kernel has a stack, _entry calls into C code at start.
+
+The function start performs some configuration that is only allowed in machine mode, and then switches to supervisor mode. To enter supervisor mode, RISC-V provides the instruction sret. This instruction is most often used to return from a previous call from supervisor mode to machine mode. start is not returning from such a call, and instead set things up as if there had been one: it sets the previous privilege mode to supervisor in the register mstatus, it sets the return address to main by writing main’s address into the register mepc,  disable virtual address translation in supervisor mode by writing 0 into th page-table register satp, and delegates all interrupts and exceptions to supervisor mode.
+
+Before jumping into supervisor mode, stack performs one more task: it programs the clock chip generate timer interrupts. With this housekeeping out of the way, start returns to supervisor mode by calling mret. This causes the program counter to change to main.
+
+After main initializes several devices and subsystems. It creates the first process by calling userinit. The first process execute a small program written in RISC-V assembly, make makes the first system call in xv6. initcode.S loads the number for the exec system call, SYS_EXEC, into register a7, and then calls ecall to re-enter the kernel.
+
+The kernel uses the number in register a7 in syscall to call the desired system call. The system call table maps SYS_EXEC to sys_exec, which the kernel invokes. As we saw in chapter 1, exec replaces the memory and registers of the current process with a new program.
+
+Once the kernel has completed exec, it returns to user space in the init process. Init creates a new console device file if needed and the open it as file descriptors 0, 1 and 2. Then it start a shell on the console. The system is up.
+
+### 2.7 system mode
+
+The operating system must assume that a process’s user-level code will do its best to wreck the kernel or other processes. User code may try to dereferece pointers outside its allowed address space; it may attempt to execute any RISC-V instructions, even those not intended for user code; it may try to read and write RISC-V control register; it may try to directly access device hardware; and it may pass clever values to system calls in an attempt to trick the kernel into crashing or doing somthing stupid. The kernel’s goal to restrict each user processes so that all it can do ti read/write/execute its own user memory, use the 32 general-purpose RISC-V registers, and affect the kernel and other processes in the ways that system calls are intended to allow. The kernel must prevent any other actions. This is typically an absolute requirement in kernel design.
+
+The expectations for the kernel’s own code are quite different. Kernel code is assumed to be written by well-meaning and careful programmers. Kernel code is expected to be bug-free, and certainly to contain nothing malicious. The assumption affects how we analyze kernel code. For example, there are many internal kernel functions that would cause serious problem if kernel code use them incorrectly. When examining any specific piece of kernel code, we will convince ourselves that it behaves correctly. We assume, however, that kernel code in general is correctly written, and follows all the rules about use of kernel’s own functions and data structures. At the hardware level, the RISC-V CPU, RAM, disk, etc. are assumed to operate as advertised in the documentation, with no hardware bugs.
+
+Of course in real life things are not so straightforward. It’s difficult to prevent clever user code from making a system unusable by consuming kernel-protected resources disk space, CPU time, process table slots, etc. It’s usually impossible to write bug-free code or design bug-free hardware. If the writers of malicious user code are aware of kernel or hardware bugs, they will exploit them.
+
+It is worthwhile to design safeguards into the kernel against the possibility that it has bugs: assertion, type checking, stack guard pages, etc.
+
+Finally, the distinction between user and kernel code is something blurred: some privileged user-level processes may provide essential services and effectively be part of the operating system, and in some operating systems privilege user code can insert new code into the kernel.
+
+### 2.8 real world
+
+Most operating systems have adopted the process concept, and most processes look similar to xv6’s. Modern operaitng systems, however, support several threads within a process, to allow a single process to exploit multiple CPUs, Supporting multiple thread in a process involves quite a bit of machinery that xv6 doesn’t have, including potential interface changes, to control which aspects of a process thread share.
+
+
+
+
+
 
 
 
