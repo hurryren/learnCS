@@ -254,6 +254,66 @@ Each RISC-V CPU caches page table entries in a Translation Look-aside Buffer(TLB
 
 To avoid flushing the complete TLB, RISC-V CPUs may support address spaces identifiers. The kernel can then flush just TLB entries for a particular address spaces.
 
+### 3.4 Physical memory allocation
+
+The kernel must allocate and free physical memory at run-time for page tables, user memory, kernel stacks, and pipe buffers.
+
+xv6 uses the physical memory between the end of the kernel and PHYTOP for run-time allocation. It allocates and frees whole 4096-byte pages at a time. It keeps track of which pages are free by threading a linked list through the pages themselves. Allocation consists of removing a page from the linked list; freeing consists of adding the freed page to the list.
+
+### 3.5 physical memory allocator
+
+The allocator resides in kalloc.c. The allocator’s data structure is a free list of physical memory pages that are available for allocation. Each free page’s list element is a struct run. Where does the allocator get the memory to hold that data structure? It store each free page’s run structure in the free page itself, since there’s nothing else stored there. The free list is protected by a spin lock. The list and the lock are wrapped in a struct to make cleat that the lock protect the fields in the struct. for now, ignore the lock and calls to acqueire and release;
+
+The function main calls kinit to initialize the allocator. Kinit initilizes the free list to hold every page between the end of the kernel and PHYSTOP.xv6 ought to determine how much physical memory is availabel by parding configuration information provided by the hardware. Instead xv6 assumes that the machine has 128 megabytes of RAM. kinit calls freerange to add memory to the free list via per-page calls to kfree. A PTE can only refer to a physical address that is aligned on a 4096-byte boundary (is a multiple of 4096), so freerange uses PGROUNUP to ensure that it frees only aligned physical addresses. The allocator starts with no memoryl; these calls to kfree give it some to manage.
+
+The allocator sometimes treats addresses as integers in order to perform arithmetic on them, and somtimes uses addresses as pointers to read and write memory;this dual use of addresses is the main reason that the allocator code is full of C tyep casts. The other reason is that freeing and allocating inherently change the tyep of the memory.
+
+The function kfree begins by setting every byte in the memory being freed to the value 1. This will cause code that uses memory after freeing it to read garbage instead of the olf valid contents; hopfully that will cause such code to break faster. Then kfree prepends the page to the free list: it casts pa to a pointer to struct run, records the old start of the free list in r->next, and sets the free list equal to r.kalloc removes and returns the first element in the free list.
+
+### 3.6 process address space
+
+each process has a separate page table, and when xv6 switches between processes, it also changes page tables. a process’s user memory starts at virtual address zero and can grow up to MAXVA, allowing a process to address in principle 256Gigabytes of memory.
+
+When a process ask xv6 for more user memory, xv6 first uses kalloc to allocate physical pages. It then adds PTEs to the process’s page table that point to the new physical pages. Xv6 sets the PTE-W,PTE_X, PTE_R, PTE_U, and PTE_V flags in these PTEs. Most processes do not use the entire user address space; xv6 leaves PTE_V clear in unused PTEs.
+
+We see here a few nice examples of use of page tables. First, different processes’ page tabls translate user addresses to different pages of physical memory, so that each process has private user memory. Second, each process sees its memory can be non-contiguous. Third, the kernel maps a page with trampoline code at the top of the user address space, thus a single page of physical memory shows up in all address spaces.
+
+The stack is a single paghhe, and is shown with the initial contents as created by exec. Strings containing the command-line arguments, as well as an array of pointers to them, are at the very top of the stack. Just under that are values that allows a program to start at main as if the function main had just been called.
+
+To detect a user stack overflowing the allocated stack memory, xv6 places an inaccessible guard page right below the stack by clearing the PTE_U flag. If the user stack overflows and the process tries to use an address below the stack, the hardware will generate a page-faule exception because the guard page is inaccessible to a program running in user mode. A real-world operaing system might instead automatically allocate more memory for the user stack when it overflows.
+
+### 3.7 sbrk
+
+sbrk is the system call for process to shrink or grow its memory. The system call is implemented by the function growproc. growproc calls uvmalloc or uvmdealloc, depending on whether n is positive or negative. uvmalloc allocates physical memroy with kalloc, and adds PTEs to the user page table with mappages. uvmdealloca calls uvmunmap, which uses walk to find PTEs and kfree to free the physical memory they refer to.
+
+xv6 uses a process’s page table not just to tell the hardware how to map user virtual addresses, but also as the only record of which physical memory pages are allocated to that process. That is the reason why freeing user memory requires examination of the user page table.
+
+### 3.8 exec
+
+exec is the system call that creates the user part of an address space. It initializes the user part of an address space from a file stored in the file system. Exec opens the named binary path using namei. Then, it reads the ELF header. Xv6 applications are described in the widely-used ELF format. An ELF binary consists of an ELF header, struct elfhdr, followed by a sequence of program section headers, struct proghdr. Each proghdr describes a section of the application that must be loades into memory; xv6 programs have only one program section header, but other systrems might have separate sectinos for instructins and data.
+
+The first step is a quick check that the file probably contains an ECL binary. An ELF binary starts with the four-byte magic number 0x7f, e,l,f, or ELF_MAGIC. If the ELF header has the right magic numebr, exec assumes that the binary is well-formed.
+
+Exec allocates a new page tbale with no user mappings with proc_pagetable, allocates memory for each ELF segment with uvmalloc, and loads each segments into memory with loadseg. loadseg yses walkaddr to find the physical address of the allocated memory at which to write each page of the ELF segment, and readi to read from the file.
+
+The program section headers filesz may be less than the memsz, indicating that the gap between them should be filled with zeros rather than read from the file.
+
+It is easy for a kernel developer to omit a crucial check, and read-world kernels hacve a long history of missing checks whose absence can be exploited by user programs to obtain kernel privileges. It is likely that xv6 does not do a complete job of validating user-level data supplied to the kernel, which a malicious user program might be able to exploit to circumvent xv6’s isolation.
+
+### 3.9 real world
+
+Like most operating systems, xv6 uses the paging hardware for memory protection and mapping. Most operating systems make far more sophisticated use of pageing than xv by combining pageing and page-fault exceptions.
+
+Xv6 is simplified by the kernel’s use of a direct map between virtual and physical addresses, and by its assumption that there is physical RAM at address 0x8000000, where the kernel expects to be loaded. This works with QEMU, but on real headware it turns out to be bad idea; real hardware places RAM and devices at unpredictable physical addresses, so that there might be no RAM at 0x8000000, where xv6 expect to be able to store the kernel, More serious kernel designs exploit the page table to turn arbitrary hardware physical memory layouts into predictable kernel virtual address layouts.
+
+RISC-V supports protection at the level of physical addresses, but xv6 doesn’t use that feature.
+
+On machines with lots of memory it mights make sense to use RISC-V support for suprt pages. small pages make sense when physical memory is small, to allow allocation and page-out to disk with fine granularity. For example, if a program uses only 8 kilobytes of memory, giving it a whole 4-megabyte super-page of physical memory is wastful. Larger pages make sense on machines with lots of RAM, and may reduce overhead for page-table manipulation.
+
+The xv6 kernel’s l;ack of a malloc-like allocator that provide memory for small objects prevents the kernel from using sophisticated data structures that would require dynamic allocation.
+
+memory allocation is a perenial hot topic, the basic problems being efficient use of limited memory and preparing for unknown future requests.Today people care more about speed than space efficiency. In addition, a more elaborate kernel would likely allocate many different size of small blocks, rather thatn just 4096-byte blocks; a real kernel allocator would need to hadle small allocation as well as large ones.
+
 
 
 
