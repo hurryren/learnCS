@@ -314,6 +314,272 @@ The xv6 kernel’s l;ack of a malloc-like allocator that provide memory for smal
 
 memory allocation is a perenial hot topic, the basic problems being efficient use of limited memory and preparing for unknown future requests.Today people care more about speed than space efficiency. In addition, a more elaborate kernel would likely allocate many different size of small blocks, rather thatn just 4096-byte blocks; a real kernel allocator would need to hadle small allocation as well as large ones.
 
+## chapter 4 traps and system calls
+
+There are three kinds of event which cause the CPU to set aside ordinary execution of instructions and force a transfer of control to special code that handles the event. One situation is a system call, when a user program executes the *ecall* instruction (user or kernel) does somthing illegal, such as divide by zero or use an ivalid virtual address. The third situation is a device interrupt, when a device signals that it needs attention, for example when the disk hardware finishes a read or write request.
+
+This book uses trap as a generic term for these situations. Typically whatever code was executeing at the time of the trap will later need to resume, and shouldn’t need to be aware that anything special happeded. That is, we often want traps to be transparent; this is particulay important for device interrupts, which the interrupted code typically doesn’t expect. The usual sequence is that a trap forces a transfer of control into the kernel; the kernel saves registers and other state so that execution can be resumed; the kernel executes appropriate handler code(e.g., a system call implementation or device driver); the kernel restores the saved state and returns from the trap; and the original code resumes where it left off.
+
+xv6 handles all traps in the kernel; traps are not delivered to user code. Handling traps in the kernel is natural for system calls. It make s sense for interrupts since isolation demands that only the kernel be allowed to use devices, and because the kernel is a convenient mechanism with which to share device among multiple process. It also makes sense for exception since xv6 responds to al exceptions from user space by killing the offending program.
+
+Xv6 trap handling proceeds in four stages: hardware actins taken by the RISC-V CPU, some assembly instruction that prepare the way for kernel c code, a C function that decides what to do with the trap, and the system call or device-driver service routine. While commonality among the three trap types suggests that a kernel could handle all traps with a single code path, it turns out to be convenient to have separate code for three distinct cases: traps from user space, traps from kernel space, and timer interrupts. Kernel code (assembler or C) that processes a trap is often called a handler; the first handler instructions are usually written in assembler(rather than C) and are sometimes called a vector.
+
+### 4.1 RISC-V trap machinery
+
+Each risc-v CPU has a set of control registers that the kernel writes to tell the CPU how to handle traps, and that the kernel can read to find out about a trap that has occured. The RISC-V documents contain the full story[1].riscv.h(kernel/riscv.h) contains definition that sv6 uses. Here’s an outline of the most important registers:
+
+-   *stvec*: The kernel writes the address of its trap handler here; the RISC-V jumps to the address in stevc to handle trap.
+-   *sepc*: When a trap occurs, RISC-V saves the programs counter here(since the pc is then overwritten with the value in stvec). The sret (return from trap) instruction copies sepc to pc. The kernel can write sepc to control where sret goes.
+-   *scause*: RISC-V puts number here that describes the reason for the trap.
+-   *sscratch*: The kernel placves a value here that comes in handy at the very start of a trap handler.
+-   *sstatus*: The SIE bit in sstatus controls whether device interrupts are enabled. If the kernel clears SIE, the risc-v will defer device interrupts until the kernel sets SIE. The SPP bit indicates whether a trap came from user mode or supervisor mode, and controls to what mode sret returns.
+
+The above registers relate to traps handled in supervisor mode, and they can not be read or written in user mode. There is similar set of control registers for traps handled in machine mode; xv6 uses them only for the special case of timer interrupts.
+
+Each cpu on a multi-core chip has its own set of these registers, and more than one CPU may be handling a trap at any given time.
+
+When it needs to force a trap, the RISC-V hardware does the follwing for all trap types(other than timer interrupts):
+
+1.   If the trap is a device interrupt, and the sstatus SIE bit is clear, don’t do any of the following.
+2.   Disable interrupts by clearing the SIE bit in sstatus.
+3.   Copy the pc to sepc.
+4.   save the current mode(user or supervisor) in the spp bit in sstatus.
+5.   set scause to reflect the trap’s cause.
+6.   set the mode to supervisor.
+7.   copy stvec to the pc
+8.   start executing at the new pc.
+
+Note that the CPU does not switcch to the kernel page table, does not switch to a stack in the kernel, and does not save any registers other than the pc. kernel software must perform these tasks. One reason that the CPU does minimal work during a trap is to provide flexibility to software; for example, some operating systems omit a page table switch in some situations to increate trap performance.
+
+It is worth thinking about whether any of the steps listed above could be omitted, paerhaps in search of faster traps. Though there are situations in which a simpler sequence can work, many of the steps would be dangerous to omit in general. For example, suppose that the CPU did not switch program counters. Then a trap from user space could switch to supervisor mode while still running user instructions. Those user instructions could break user/kernel siolation, for example by modifying the satp register to point to a page table that allowed accessing all of physical memory. It is thus importtant that the CPU switch to a kernel-specified instrction address, namely stvec.
+
+### 4.2 traps from user space
+
+xv6 handles traps differently depending on whether it is executing in the kernel or in user code.
+
+A trap may occur while executing in user space if the user program makes a system call(ecall instruction), or does something illegal, or if a device interrupts. The high-level path of a trap from user space is uservec, then usertrap; and when returning, usertrapret and then userret.
+
+A major constraint on the design of xv6’s trap handling is the fact that the risc-v hardware does not switch page tables when it forces a trap. This means that the trap handler address in stvec must have avalid mapping in the user page table, since that  is the page table in force when the trap handling code starts executing. Furthermore, xv6’s trap handling code needs to switch to the kernel page table; in order to be able to continue executing after that switch, the kernel page table must also hacve a mapping for the handler pointed to by stvec.
+
+xv6 satisfies these requirements using a trampoline page. The trampoline page contains uservec, the xv6 trap handline code that stvec points to. The trampoline page is mapped in every process’s page tbal at address TRAMPOLINE, which is at the end of the virtual address space so that it will be above memroy that programs use for themselves. The trampline page is also mapped at address TRAMPOLINE in the kernel page tabel. Because the trampoline page is mamped in the user page tbale, with the PTE_U flag, traps can start executing there in supervisor mode. Because the trampoline page is mapped at the same address in the kernel address space, the trap handler can continue to execute after it switches to the kernel page table.
+
+The code for the uservec trap handler is in trampoline.s. When uservec starts, all 32 registers contain values owned by the interrupted user code. These 32 values need to be saved somewhere in memory, so that they can be restored when the trap returns to user space. Storing to memroy requires use of a register to hold the address, but at this point there are no general-purpose registers availabel! Luckily RISC-V provides a helping hand in the form of the sscratch register. The cerrw instruction at the start of uservec swaps the contents of a0 and sscratch. Now the user code’s a0 is saved in sscratch; uservec has one register(10) to play with; and a0 contains the value the kernel previously placed in sscratch.
+
+uservec’s next task is to save the 32 user registers. Before entering user space, the kernel set sscratch to point to a per-process trapframe structure that has space to save the 32 user register. Because satp stil refers to the user page table, uservec needs the trapframe to be mapped in the user address space. When creating each process, xv6 allocates a page for the process’s trapframe, and arranges for it always to be mapped at user virtual address TRAPFRAME, though at its physical address so the kernel can use it through the kernel page table.
+
+Thus after swapping a0 and sscratch, a0 holds a pointer to the current process’s trapframe. uservec nows saves all user registers there, including the user’s a0, read from sscratch.
+
+The trapframe contains the address of the current process’s kernel stack, the current CPU’s hartid, the address of the usertrap function, and the address of the kernel page table. uservec retrieves these values, switches satp to the kernel page table, and calls usertrap.
+
+The job of usertrap is to determine the cause of the trap, process it, and return. It first changes stvec so that a trap while in the kernel will be handled by kernelvec rather than uservec. It saves the sepc register (the saved user program counter), because usertrap might call yield to switch to another process’s kernel thread, and that process might return to user space, in the process of which it will modify sepc. If the trap is a system call, usertrap calls syscall to handle it; if a device interrrupt, devintr; otherwise it is an exception, and the kernel kills the faulting process. The system call path adds four to the saced user program counter because RISC-V, in the case of a system call ,leaves the program pointer pointing to the ecall instruction but user code needs to resume executing at the subsequent instruction. on the way out, usertrap checks if the process has been keiiled or should yield the CPY (if this trap is a timer interrupt).
+
+The first step in returning to user space is the call usertrapret. This function sets up the risc-v control registers to prepare for a future trap from user space. This involues changing stvec to refer to uservec, preparing the trapframe fields that uservec relied on, and setting sepc to the previously saved user program counter. At the end, usertrapret calls userret opn the trampoline page that is mapped in both user and kernel page tbales; the reason is that assembly code in userret will switch page tables.
+
+usertrapret’s call to userret passes trapframe in a0 and a pointer to the process’s user page tbale in a1. userret switches satp to the process’s user page table. Recall that the user page table maps both the trampoline page and trapframe, but nothing else from the kernel. The fact that the trampoline page is mapped at the same virtual address in user and kernel page tbales is waht allows uservec to keep executing after changing satp. userret copies the trapframe’s saved user a0 to sscratch in preparation for a later swap with trapframe. from this point on, the only data userret can use is the register contents and the content of the trapframe. Next userret restores saved user registers from the trapframe, does a dinal swap of a0 and sscratch to restore the user a0 and save trapframe for the next trap, and executes sret to return to user space.
+
+### 4.3 callinig system calls
+
+chapter 2 ended with initcode.s invoking the exec system call. let’s look at how the user call makes its way to the exec system call’s implementation in the kernel.
+
+initcode.s palces the arguments for exec in registers a0 and a1, and puts the system call number in a7. system call numbers match the entries in the system calls array, a table of function pointers. The ecall instruction traps into the kernel and causes uservec, usertrap, and then syscall to execute, as we saw above.
+
+syscall retrieves the system call number from the saved a7 in the trapframe and uses it to index into syscalls. For the first system call, a7 contains sys_exec, resulting in a call to the system call implementation function sys_exec.
+
+When sys_exec returns, syscall records its return value in p->trapframe->a0. This will cause the original user-space call to exec() to return that value, since the C calling convention on risc-v places return values in a0. system calls conventionally return negative numbers to indicate errors, and zero or positive numbers for success. If the system call number is invalid, syscall prints an error and returns -1.
+
+### 4.4 system call arguments
+
+system call implementations int the kernel need to find the arguments passed by user code. Because user code calls system call wrapper functions, the arguments are initially where the risc-v c calling convention palces them: in registers. The kernel trap code saves user registers to the current process’s trap frame, where kernel code can find them. The kernel kernel functions argint agaddr, and argfd retrieve the n’th system call argument from the trap frame as an integer, pointer, or a file descriptor. They all call argraw to retrieve the appropriate saved user register.
+
+Some system calls pass pointers as arguments, and the kernel must use those pointers to read or write user memory. The exec system call, for example, passes the kernel an array of pointers referring to string arguments in user space. These pointers pose two chanllenges. First, the user program may be buggy or malicious, and may pass the kernel an invalid pointer or a pointer intended to trick the kernel into accessing kernel memory instead of user memory. Second, the xv6 kernel page tbale mappigns are not the same as the user page tbale mappings, so the kernel cannot use ordinary instructions to load ot store from user-supplied addresses.
+
+The kernel implements functions that safely transfer data to and from user-supplied addresses fetchstr is an example. File system calls such as exec use fetchstr to retrieve string file-name argmuments from user space. fetchstr calls copyinstr to do the hard work.
+
+copyinstr copies up to max bytes to dst from virtual address scrva in the user page tbale pagetable. since pagetbale is not the current page tbale, copyinstr uses walkaddr to look up srcva in pagetabel, yielding physical address pa0. the kernel maps each physical ram address to the corresponding kernel virtual address , so copyinstr can directly copy string bytes form pa0 to dst. walkaddr checks that the user-spplied virtual address is part of the process’s user address space, so programs cannot trick the kernel into reading other memory. A similar function, copyout, copied data from the kernel to a user-supplied address.
+
+### 4.5 traps from kernel space
+
+xv6 configures the CPU trap registers somewaht differently depending on  whether user or kernel code is executing. When the kernel is executing on a CPU, the kernel points stvec to the assembly code at kernelvec. Since xv6 is already in the kernel, kernelvec can rely on satp being set to the kernel page table, and on the stack pointer referring to a valid kernel stack. kernelvec pushes all 32 registers onto the stack, from which it will later restore them so that the interrupted kernel code can resume without disurbance.
+
+kernelvec saves the registers on the stack of the interrupted thread, which makes sense because the register values belong to that thread. This is particularly important if the trap causes a switch to a different thread-in that case the trap will actually return from the stack of the new thread, leaving the inerrupted thread’s saved registers safely on its stack.
+
+kernelvec jumps to kerneltrap after saving registers. Kerneltrap is prepared for two types opf traps: device interrupts and exceptions. It calls devints to check for and handle the former. If the trap is not a device interrupt, it must be an exception, and that is always a fatal error if it occurs in the xv6 kernel; the kernel calls panic and stops executing.
+
+if kerneltrap was called due to a timer interrupt, and a process’s kernel thread is running, kerneltrap calls yield to give other threads a chance to run. At some point one of those thrads will yield, and let our thread its kerneltrap resume again.
+
+When kerneltrap’s work is done, it needs to return to whatever code was interrupted by the trap. Because a yield may have disturbed sepc and the preivous mode in sstatus kerneltrap saves them when it starts. It now restores those control registers and returns to kernelvec. Kernelvec pops the saved registers form the stack and executes sret, which copies sepc to pc and resumes the interrupted kernel code.
+
+It is worth thinking through how the trap return happens is kerneltrap called yield due to a timer interrupt.
+
+xv6 sets a pcu’s stvec to kernelvec when that cpu enters the kernel from user space; you can see this in usertrap. There is a window of time when the kernel has started executing but svec is still set to uservec, and it is crucial that no device interrupts occur during that window. Luckily the risc-v always disables interrupts when it start to take a trap, and xv6 does not enabel them againe until after it sets sevec.
+
+### 4.6 pagefault exception
+
+xv6 response to exceptions is quite boring: if an exception happes in user space, the kernel kills the faulting process. If an exception happeds in the kernel, the kernel panics. Real operating systems often respond in much more interesting ways.
+
+As an example, many kernels use page faults to implement cop-on-write fork. fork causes the child’s initial memory content to be the same as the parent’s at the time of the fork. xv6 implements fork with uvmcopy, which allocates physical memory for the child and copies the parent’s memory into it. It would be more efficient if the child and parent could share the parent’s physical memory. A straightforward implemetation of this would not work, however, since it would cause the parent and child to distrpt each other’s execution with their writes to the shared stack and heap.
+
+parent and child can safely share physical memory by appropriate use of page-tbale permissions and page faults. The CPU raises a page-fault exception when a virtual address is used that has no mapping in the page table, or has a mapping whose pte_v flas is clear, or a mapping whose permission bits forbid the operation being attempted. RISC-V distinguishes three kinds of page faults(when a store instruction can not translate its virtual address), and instruction page faults(when the address in the program counter does not translate). The scause register indicates the type of the page fault and the stval register contains the address that could not be translated.
+
+The basic plan in COW fork is for the parent and child to initially share all physical pages, but for each to map them read-only(with the PTE-W flag clear). Parent and child can read from the shared physical memory. If either writes a given page, the RISC-V CPU raises a page-fault exception. The kernel’s trap handler responds by allocating a new page of physical memory and copying into it the physical page that the faulted address maps to. The kernel changes the relevant PTE in the faulting process’s page tbale to point to the copy and to allow writes as well as reads, and then resumes the faulting process at the instruction that caused the fault. Because the PTE allows writes, the re-executed instruction will now execute without a fault. Copy-on-write requires book-keeping to help decide when physical pages can be freed, since each page can be referenced by a varying number of page tables depending on the history of forks, page faults, execs, and exits. This book-keeping allows an important optimization: if a process incurs a store page fault and the physical page is only referred to from that process’s page tbale, no copy is needed.
+
+copy-on-write makes fork faster, since fork need not copy memroy. Some of the memory will have to be copied later, when written, but it is often the cases that most of the memory never has to be copied. A common example is fork followed by exec: a few pages may be written after the fork, but then the child’s exec releases the bulk of the memory inherited from the parent. Copy-on-write fork eliminates the need to ever copy this memory. Furthermore cow fork is transparent: no modifications to applications are necessary for them to benefit.
+
+The combination of page tables and page faults opens up a wide range of interesting possibilities in addition to cow fork. Another widely-used feature is called lazy allocation, which has two parts, First, when an application asks for more memory by calling sbrk, the kernel notes the increase in size, but does not allocate physical memory and does not create PTEs for the new range of virtual addresses, Second , on a page fault on one those new addresses, the kernel allocates a page of physical memory and maps it into the page tbale. Like COW fork, the kernel can implements lazy allocation transparently to applications.
+
+Since applications often ask for more memory than they need, lazy allocation is a win: the kernel does not have to do any work at all for pages that the application never uses. Furthermoew, if the application is asking to grow the address space by a lot, then sbrk without lazy allocation is expensive: if an application asks for a gigabyte of memory, the kernel has to allocate and zero 262,144 4096-byte pages. Lazy allocation allows this cost to be spread over time. On the other hand, lazy allocation incurs the extra overhead of page faults, which involve a kernel/user transition. Operating systems can reduce this cost by allocating a batch of consecutive pages per page fault instead of on page and by specializing the kernl extry/exit for such page-faults.
+
+Yet another widely-used feature that exploits page faults is demand paging. In exec, xv6 loads all text and data of an application eagerly into memory. Since applications can be large and reading from disk is expensive, this startup cost may be noticeable to users: when the user starts a large application from the shell, it may take a long time before user sees a response. To improve response time, a modern kernel creates the page tbale for the user address space, but marks the PTEs for the pages invalid. On a page fault, the kernel reads the content of the page from disk and map it into transparently to applications.
+
+The programs running on a computer may need more memory than the computer has RAM. To cope gracefully, the operating system may implement paging to disk. The idea is to store only a fraction of user pages in RAM, and to store the rest on disk in a paging area. The kernel marks PTEs that correspond to memory stored in the paging area(and thus not in RAM) as invalid. If an application tries to use one of pages that has been paged out to disk,the application will incur a page fault, and the page must be paged in: the kernel trap handler will allocate a page of physical RAM, read the page from disk into the RAM, and modifu the relevant PTE to point to the RAM.
+
+What happens if a page needs to be paged in, but there is no free physical RAM? in that case, the kernel must first free a physical page by paging it out ot evicting it to the paging area on disk, and marking the PTEs referring to that physical page as invalid. Eviction is expensive, so paging performs best if it is infrequent: if applications use only a subset of their memory pages and the union of the subsets fits in RAM. This property is often referred to as having good locality of reference. As with many virtual memory techniques, kernel usually implement paging to disk in a way that is transparent to applications.
+
+Computers often operate with little or no free physical memory, regardless of how much RAM the hardware provides. For example, cloud providers multiplex many customers on a single machine to use their hardware cost-effectively. As another example, users run many applications on smart phones in a small amount of physical memory. In such setting allocating a page may require first evicting an existing page. Thus, when free physical memory is scarce, allocation is expensive.
+
+Lazy allocation and demand paging are particularly advantagous when free memory is scarce. Eagerly allocating memory in sbrk or exec incurs the extra cost of eviction to make memory availabel. Furthermore, there is a risk that the eager work is wasted, because before the application uses the page, the operating system may have evictted it.
+
+Other features that combine paging and page-fault exceptions include automatically extending stacks and memory-ampped files.
+
+### 4.7 real world
+
+The trampoline and trapframe may seem excessively complex. A driving force is that the RISC-V intentionally does as little as it can when forcing a trap, to allow the possibility of very fast trap handling, which turns out to be important. As a result, the first few instructionsd of the kernel trap handler effectively have to execute in the user environment: the user page tbale, and user register contents. And the trap handler is initially ignorant of useful facts such as identity of the process that’s running or the address of the kernel page table. A solution is possible because risc-v provides protected places in which the kernel can stash away information before entering user space: the sscratch register, and user page table entries that point to kernel memory but are protected by lack of PTE_U. Xv6’s trampoline and trapframe exploit these risc-v features.
+
+The need for special trampoline pages could be eliminated if kernel memory were mapped into every process’s user page tbale(with appropriate PTE permission flags). That would also eliminate the need for a page tbale switch when trapping from user space into the kernl. That in turn would allow system call implementations in the kernel to take advantage of the current process’s user memory being mapped, allowing kernel code to directly dereference user pointers. Many operating systems have used these ideas to increase efficiency. Xv6 avoids them in order to reduce the chances of security bugs in the kernel due to inadvertent use of user pointers, and to reduce some complexity that would be required to ensure that user and kernel virtual addresses do not overlap.
+
+production operating systems implement copy-on-write fork, lazy allocation, demand paging, paging to disk, memroy-mapped files, etc.
+
+## chapter 5 interrupts and device drivers
+
+a driver is the code in an operating system that manages a particular device: it configures the device hardware, tells the device to perform operations, handles the resulting interrupts, and interacts with processes that may be waiting for IO from the device. Driver code can be tricky because a driver executes concurrently with the device that it manages. In addition, the driver must understand the device’s hardware interface, which can be complex and poorly documented.
+
+devices that need attention from the operating system can usually be configured to generate interrupts, which are one type of trap. The kernel trap handling code recognizes when a device has raised an interrupt and calls the driver’s interrupt handler; in xv6, this dipatch happeds in devintr.
+
+Many device drivers execute code in tow contexts: a top hald that runs in a process’s kernel thread, and a bottom half that executes at interrupt time. The top half is called via system calls such as read and write that want the device to perform IO. This code may ask the hardware to start an operation; Then the code waits for the operation to complete. eventually the device completes the operation and raises an interrupt. The driver’s interrupt handler, acting as the bottom half, figures out what operation has completed, wakes up a waiting process if appropriate, and tells the hardware to start work on any waiting next operation.
+
+### 5.1 console input
+
+The condole driver is a simple illustration of driver structure. The console driver accepts characters typed by a human, via the uart serial-port hardware attached to the risc-v. the console driver accumulates a line of input at a time, processing special input characters such as backspace and control-u. User processes, such as the shell use the read system call to fetch lines of input from the console. When you type input to xv6 in QEMU,you keystrokes are delivered to xv6 by way of qemu’s simulated uart hardware.
+
+the uart hardware that the driver talks to is a 16550 chip emulated by qemu. On a real computer, a 16550 would manage an rs232 serial link connecting to a terminal or other computer. When running qemu, it is connected to your keyboard an display.
+
+the uart hardware appears to software as a set of memory-mapped control registers. That is, there are some physical addresses that risc-v hardware connects to the uart device, so that loads and stores interact with the device hardware rather than RAM. The memory-mapped addresses for the uart start at 0x10000000, or uart0. There are a handful of uart control registers, each the width of a byte. Their offfsets from uart0 are defined in uart.c. For example, the lsr register contain bits that indicate whether inpu characters are waiting to be read by the software. These charaters are availabel for reading from the RHR register. Each time one is read, the UART hardware deletes it from an internal fifo of waiting characters, and clears the ready bit in lsr when the fifo is empty. The Uart transmit hardware is largely independent of the receive hardware; if software writes a byte to the THR, the uart transimit that byte.
+
+xv6’s main calls consoleinit to initialize the uart hardware. This code configures the uart to generate a receive interrupt when the uart receives each byte of input, and a transmit complete interrupt each time the uart finishes sending a byte of output.
+
+The xv6 shell reads from the console by way of a file descriptor opened by init.c. calls to the read system call make their way through the kernel to consoleread. consoleread waits for input to arrive(via interrupts) anb be buffered in cons.buf, copies the input to user space, and returns to the user process. If the user has not tyuped a full line yet, any reading processes will wait in the sleep call.
+
+when the user types a character, the uart hardware asks the risc-v to raise an interrupt, which activates xv6’s trap handler to discover that the interrpt is from an external device. Then it asks a hardware unit called the PLIC to tell it which device interrupted. If it was the uart, devintr calls uartintr.
+
+Uartintr reads any waiting input characters from the uart hardware and hands them to consoleintr; it does not wait for characters, since future input will raise a new interrupt. The job of consoleintr is to accumulate input characters in conss.buf until a whole line arrives. consoleintr treats backspace and a few other characters specially. When a newline arrives, consoleintr wakes up a waiting consoleread.
+
+Once woken, consoleread will observe a full line in cons.buf, copy it to user space, and return to user space.
+
+### 5.2 console output
+
+A write system call on a file descriptor connected to the console eventually arrives at uartputs. The device driver maintains an output buffer so that writing processes do not have to wait for the uart to finish sending; instead, uartputs appends each character to the buffer, calls uartstart to start the device transmitting, and returns. The only situation in which uartputc waits is if the buffer is already full.
+
+each time the uart finishes sending a byte, it generates an interrupt. uartintr calls uartstart, whihc checks that the device really has finished sending, and hands the device the next buffered output character. Thus if a process writes multiple bytes to the console, typically the first byte will be sent by uartputsc’s call to uartstart, and the remaining buffered bytes will be sent by uartstart calls from uartintr as transmit complete interrupts arrive.
+
+A general pattern to note is the decoupline of device activity from process activity via buffering and interrupts. The console driver can process input even when no process is waiting to read it; a subsequent read will see the input. Similarly, processes can send output without having to wait for the device. This decoupline can increase performance by allowing processes to execute concurrently with device io, and is particularly important when the device is slow or needs immediate attention. This idea is sometimes called IO concurrency.
+
+### 5.3 concurrency in drivers
+
+You may have noticed calls to acquire in consoleread and in consoleintr. These calls acquire a lock, which protects the console driver’s data structures from concurrent access. There are three concurrency dangers here: two processes on different cpus might call consoleread at the same time; the hardware might ask a cpu to deliver a console interrupt while that cpu is already executing inside consoleread; and the hardware might deliver a console interrupt on a different cpu while consoleread is executing. These dangers may result in race conditions or deadlocks.
+
+Another way in which concurrency requires care in drivers is that one process may be waiting for input from a device, but the interrupt signaling arrival of the input may arrive when a different process is running. Thus interrupt handlers are not allowed to think about the process or code that they have interrupted. For example, and interrupt handler cannot safely call copyout with the current process’s page table. Interrupt handlers typically do relatively little work, and wake up top-half code to do the rest.
+
+### 5.4 timer interrupts
+
+xv6 uses timer intrerupts to maintain its clock and to enable it to switch among compute-bound processes; the yield calls in usertrap and kerneltrap cause this switching. Timer interrupts come from clock hardware attached to each RISC-V CPU. xv6 programs this clock hardware to interrupt each cpu periodically.
+
+RISC-V requires that timer interrupts be taken in machine mode, not supervisor mode. RISC-V machine mode executes without paging, and with a separate set of control registers, so it is not practical to run ordinary xv6 kernel code in machine mode. As a result, xv6 handles timer interrupts completely separately from the trap mechanism laid out above.
+
+code executed in machine mode in start.c, before main, sets up receive timer interrupts. part of the job is to program the cline hardware to generate an interrupt after a certain delay. Another part is to set up da scratch area, analogous to the trapframe, to help the timer interrupt handler save registers and the address of the clint registers. Finally, start sets mtvec to timervec and enables timer interrupts.
+
+a timer interrupt can occur at any point when user or kernel code is executing; there is no way for the kernel to disable timer interrupts during critical operations. Thus the timer interrupt handler must do its job in a way guaranteed not to disturb interrupted kernel code. The basic strategy is for the handler to ask the risc-v to raise a software interrupt and imnmediately return. The risc-v delivers software interrupts  to the kernel with the ordinary trap mechanism, and allows the kernel to disable them. The code to handle the software interrupt generated by a timer interrupt can be seen in devintr.
+
+The machine mode timer interrupt handler is timervec. It saves a few registers in the scratch area prepared by start, tells the clint when to generate the next timer interrupt, asks the risc-v to raise a sofeware interrupt, restores registers, and returns.
+
+### 5.5 real world
+
+xv6 allows device and timer interrupts while executing in the kernel,as well as when executing user programs. Timer interupts force a thread switch from the timer interrupt handler, even when executing in the kernel. The ability to time-slice the cpu fairly among kernel threads it useful if kernel thread sometimes spend a lot of time computing, without returning to user space. However, the need for kernel code to be mindful that it might be suspended and later resume on a different cpu is the source of some complexity in xv6. The kernel could be made somewhat simpler if device and timer interrupts only occurred while executing user code.
+
+## chapter 6 locking
+
+most kernels, including xv6, interleave the execution of multiple activities. One source of interleaving is multiprocessor hardware: computers with multiple CPUs executing independently, such as xv6’s risc-v. These multiple CPUs share physical RAM, and xv6 exploits the sharing to maintain data structures that all CPUs read and write. THis sharing raises the possibility of one CPU reading a data structure while another CPU is mid-way through updating is, or even multiple CPUs updating the same data simulataneously; without careful design such parallel access is likely to yield incorrect results or a broken data structure. Even on a uniprocessor, the kernel may switch the CPU among a number of threads, causing their execution to be interleaved. Finally, a device interrupt handler that modifies the same data as some interruptible code could damage the data if the interrupt occurs at just the wrong time. The word concurrency refers to situations in which multiple instructin streams are interleaved, due to multiprocessor parallelism, thread switching, or interrupts.
+
+Kernels are full of concurrently-accessed data. For example, two CPUs could simultaneously call kalloc, thereby concurrently popping from the head of the free list. Kernel designers like to allow for lots of concurrency, since it can yield increased performance though parallelism, and increased responsivenss. However, as a result kernel designers spend a lot of effort convincing themselves of correctness despite such concurrency. There are many ways to arrive at correct code, some easier to reason about than others, Straties aimed at correctness under concurrency, and abstractions that support them, are called concurrency control techniques.
+
+xv6 uses a number of concurrency control techniques, depending on the situation; many more are possible. This chapter focuses on a widely used technique: the lock. A lock provides mutual exclusion, ensuring that only one CPU at a time can hould the lock. If the programmer associates a lock with each shared data item, and the code always holds the associated lock when using an item, then the item will be used by only one CPU at a time. In this situation, we say that the lock protects the data item. although locks are an easy-to-understand concurrency control mechanism, the downside of locks is that they can kill performance, because they serialize oncurrent operations.
+
+The rest of this chapter explains why xv6 needs locks, how xv6 implements them, and how it uses them.
+
+### 6.1 race conditions
+
+as an example of why we need locks, consider two processes calling wait on two different CPUs. wait frees the child’s memory. Thus on each CPU, the kernel will call kfree to free the children’s pages. the kernel allocator manitains a linked list: kalloc() pops a page of memory from a list of free pages, and kfree() pushs a page onto the free list. For best performance, we might hope that the kfrees of the two parent processes would execute in parallel without either having to wait for the other, but this would not be correct given xv6’s kfree implementation.
+
+When we say that a lock protects data, we really mean that the lock protects some collection of invariants that apply to the data. Invariants are properties of data structure that are maintained across operations. Typically, an operations’s correct behavior depends on the invariants but must reestablist them before finishing. For example, in the linked list case, the invariant is that list points at the first element in the list and that each elements’s next field at the next element. The implementation of push violates this invariant temporarily. proper use of a lock ensures that only one cpu at a time can operate on the data structure in the critical section, so that no CPU will execute a data structure operation when the data structure’s invariants do not hold.
+
+You can think of a lock as serializing concurrent critical sections so that they run one at a time, and thus preserve invariants. You can alos think of critical sections guarded by the same lock as being atomic with respect to each other so that each sees only the complete set of changes from earlier critical sections, and never sees partially-completed updates.
+
+althrough correct use of locks can make incorrect code correct, locks limit performance. For example, if two processes call kfree concurrently, the locks will serialize the two calls, and we obtain no benefit from running them on differently, the locks will serialize the two calls, and we obtain no benefit from running them on different CPUs. We say that multiple processes conflict if they want the same lock at the same time, or that the lock experiences contention. A major chanllenge in kernel design is to avoid lock contention. Xv6 does little of that, but sophisticated kernels organize data structures and algorithms specifically to avoid lock contention. In the list example, a kernel may maintain a free list per CPU and only touch another CPU’s free list if the CPU’s list is empty and it must steal memory from another CPU. Other use cases may require more complicated designs.
+
+The placement of locks is also important for performance. For example, it would be correct to move acquire earlier in push: it is fine to move the call to acquire up to before line 13. This may reduce performance because then the calls to malloc are also serialized. The section using locks below provides some guidelines for where to insert acquire and release invocations.
+
+### 6.2 locks
+
+xv6 has two types pf locks: spinlocks and sleep-locks. We’ll start with spinlocks. xv6 represents a spinlock as a struct spinlock. The important field in the structure is locked, a word that is zero when the lock is aviilable and non-zero when it is held. Logically, xv6 should acquire a lock by executing code like:
+
+```c
+void
+acquire(struct spinlock *lk)  /* does not word */
+{
+    for(;;) {
+        if(lk->locked == 0){
+            lk->locked = 1;
+            break;
+        }
+    }
+}
+```
+
+Unfortunately, this implementation does not guarantee mutual exclusion on a multiprocessor. It could happed that two CPUs simulataneously reach line 25, see that lk->locked is zero, and then both grab the lock by executing like 26. at this point, two different CPUs hold the lock, which violates the mutual exclusion property. What we need is a way to make lines 25 and 26 execute as an atomic step.
+
+Because locks are widely used, multi-core processors usually provide instructions that implement an atomic version of line 25 and 26. On the risc-v this instructin is amoswap r,a. amoswap reads the value at the memory address a, writes the contents of register r to that address, and puts the value it read into r. That is, it swaps the contents of the register and the memory address. It performs this sequence atomically, using special hardware to prevent any other CPU from using the memory address between the read and the write.
+
+Xv6’s acquire uses the portable C library call __sync_lock_test_and_set, shich boils down to the smoswap instruction; the return value is the old contents of lk->locked. The acqueire function wraps the swap in a loop, retrying until it has acquired the lock. Each iteration swaps one into lk->locked and checks the previous value; If the previous value is zero, then we have acquired the lock, and the swap will have set lk->locked to one. if the previous value is one, then some other CPU holds the lock, and the fact that we aromically swapped on int lk->locked did not change its value.
+
+Once the lock is acquired, acquire records, for debugging, the CPU that acquired the lock. the lk->cpu field is protected by the lock and must only be changed while holding the lcok.
+
+The function release is the oppsite of acquire: it clears the lk->cpu field and then releases the lock. conceptually, the release just requires assigning zero to lk->locked. The C standard allows compilers to implement an assignment with multiple store instructions, so a C assignment might be non-stomic with respect to concurrent code. Instead, release used the C library function __sync_lock_release that performs an atomic assignment. This function also boils down to a risc-v amoswap instruction.
+
+### 6.3 using lock
+
+xv6 uses locks in many places to avoid race conditins. As decribed above, kalloc and free form a good example. 
+
+A hard part about using locks is deciding how many locks to use and which data and invariants each lock should protect. There are a few basic principle. First, any time a variable can be written by one CPU at the same time that another CPU can read or write it, a lock should be used to keep the two operations from overlapping. Second, remember that locks protect invariants: if an invariant involves multiple memory locations, typically all of them need to be protected by a single lock to ensure the invariant is maintained.
+
+The ruls above say when locks are necessary but say nothing about when locks are unnecessary, and it is important for efficiency not to lock too much, because locks reduce paralleism. If paralleism is not important for efficiency not to lock too much, because locks reduce paralleism. If parallelism is not important, then one could arrange to have only a single thread and not worry about locks. A simple kernel can do this on a multiprocessor by having a single lock that must be acquired on entering the kernel and release on exiting the kernel(through system calls such as pipe reads or wait would pose a probelm). Many uniprocessor operating systems have been converted to run on multiprocvessors using this approach, sometimes called a big kernel lock, but the approach sacrifices parallelism: only one CPU can execute in the kernel at a time. If the kernel does any heavy computation, it would be more efficient ot use a larger set of more fine-grained locks, so that the kernel could execute on multiple CPUs simultaneously.
+
+As an example of coarse-grained locking, xv6’s kalloc.c allocator has a single free list protected by a single lock. If multiple processes on different CPUs try to allocate pages at the same time, each will have to wait for its turn by spinning in acquire. Spinning reduces performance, since it is not useful work. if contention for the lock wasted a signigicant fraction of CPU time, perhaps performance could be improved by changing the allocator design to have multiple free lists, each with its own lock, to allow truly parallel allocation.
+
+As an example of fine-grained locking, xv6 has a separate lock for each fine, so that processes that manipulate different files can often procedd without waiting for each others’ locks. the file locking schewme could be made even more fine-grained if one wanted to allow processes to simulataneously write different ateas of the same file. Ultimately lock granularity decisions need to be driven by performance measurements as well as complexity consiferations.
+
+as subsequent chapters explain each part of xv6, they will mention examples of xv6’s use of locks to deal with concurrency.
+
+### 6.4 deadlock and lock ordering
+
+xv6 has many lock-order chains of length two involving per-process locks(the lock in each struct proc) due to the way that sleep works. For example, consoleintr is the interrupt routine which handles typed characters. when a newline arrives, any process that is waiting for console input should be woken up. To do this, consoleintr holds cons.lock while calling wakeup, whihc acquires the waiting process’s lock in order to wake it up. I consequence, the global deadlock-avoiding lock order includes the ruls that cons.lock must be acquired before any process lock. The fine system code contains xv6’s longest lock chains. For example, creating a file requires simulataneously holding a lock on the directory, a lock on the new file’s inode, a lock on a disk block buffer, the disk driver’s vdisk_lock, and the calling process’s p->lock. To avoid deadlock, file-system code always acquires locks in the order mentioned in the previous sentence.
+
+
+
+
+
+
+
+
+
 
 
 
